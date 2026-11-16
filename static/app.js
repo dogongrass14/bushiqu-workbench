@@ -302,11 +302,35 @@
     for (var j = 0; j < hist.length; j++) {
       if (hist[j].request_id === reqId) return { ok: true, deduplicated: true, data: snap };
     }
-    var statusMap = { approve: "approved", request_changes: "feedback_submitted", reject: "rejected" };
-    var statusLabelMap = { approved: "已通过", feedback_submitted: "作者已反馈", rejected: "暂不采用" };
-    var actionLabelMap = { approve: "确认通过", request_changes: "提交修改意见", reject: "暂不采用" };
+    var statusMap = {
+      approve: "approved",
+      unselect: "pending",
+      request_changes: "feedback_submitted",
+      return_rozi_prompt: "feedback_submitted",
+      return_codex_typography: "feedback_submitted",
+      set_primary_cover: target.current_status || "pending",
+      reject: "rejected"
+    };
+    var statusLabelMap = { approved: "已通过", feedback_submitted: "作者已反馈", rejected: "暂不采用", pending: "未确认" };
+    var actionLabelMap = {
+      approve: "确认通过",
+      unselect: "取消勾选",
+      request_changes: "提交修改意见",
+      return_rozi_prompt: "退回 Rozi 重出提示词",
+      return_codex_typography: "仅让 Codex 微调排字位置",
+      set_primary_cover: "选定首发主封面",
+      reject: "暂不采用"
+    };
     var statusAfter = statusMap[ctx.action] || "pending";
     var nowStr = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+
+    if (ctx.type === "packaging" && (ctx.primaryVariant === "A" || ctx.primaryVariant === "B")) {
+      target.primary_cover_variant = ctx.primaryVariant;
+      target.backup_cover_variant = ctx.primaryVariant === "A" ? "B" : "A";
+    }
+    if (ctx.action === "return_rozi_prompt") target.last_return_target = "rozi_prompt";
+    else if (ctx.action === "return_codex_typography") target.last_return_target = "codex_typography";
+    else if (ctx.action === "approve") target.last_return_target = null;
 
     hist.push({
       event_id: "cloud_" + reqId,
@@ -376,6 +400,7 @@
           target_version: ctx.version,
           action: ctx.action,
           comment: comment,
+          primary_variant: ctx.primaryVariant || undefined,
           submitted_at: applied.submitted_at,
           source: "github_cloud_mobile"
         };
@@ -500,6 +525,16 @@
     return matched;
   }
 
+  function findPipelineByProjectId(projectId) {
+    if (!state.data || !Array.isArray(state.data.pipelines) || !projectId) return null;
+    for (var i = 0; i < state.data.pipelines.length; i++) {
+      if (state.data.pipelines[i] && state.data.pipelines[i].project_id === projectId) {
+        return state.data.pipelines[i];
+      }
+    }
+    return null;
+  }
+
   function evaluatePackagingVersion(ver, pkgItem) {
     var latest = (pkgItem && pkgItem.latest) || {};
     var v = ver || latest;
@@ -522,12 +557,26 @@
       missing = pkgItem.missing_fields.slice();
     }
 
+    var cvObj = (v && v.cover_variants) || (v === latest && pkgItem && pkgItem.cover_variants) || {};
+    var hasAbPrompts = Boolean(
+      cvObj && cvObj.A && String(cvObj.A.image_prompt || "").trim() &&
+      cvObj.B && String(cvObj.B.image_prompt || "").trim()
+    );
+    var isShortsPkg = Boolean(
+      (v && String(v.video_format || "").toLowerCase() === "shorts") ||
+      (pkgItem && String(pkgItem.video_format || "").toLowerCase() === "shorts")
+    );
+    var hasBrokenImgs = imgs.some(function (img) { return img && img.exists === false; });
+    var hasValidCover = isShortsPkg || hasAbPrompts || (imgs.length > 0 && !hasBrokenImgs);
+
     if (!hasBackendMissing || v !== latest) {
       missing = [];
       if (!titleStr) missing.push("标题");
       if (!descStr) missing.push("简介");
-      if (!imgs.length) missing.push("封面");
-      else if (imgs.some(function (img) { return img && img.exists === false; })) missing.push("封面（文件缺失）");
+      if (!isShortsPkg) {
+        if (hasBrokenImgs) missing.push("封面（文件缺失）");
+        else if (!hasAbPrompts && !imgs.length) missing.push("A/B 封面提示词");
+      }
     }
 
     var backendComplete = null;
@@ -541,15 +590,17 @@
       else if (typeof v.is_complete === "boolean") backendComplete = v.is_complete;
     }
 
-    var localComplete = Boolean(titleStr && descStr && imgs.length && !imgs.some(function (img) { return img && img.exists === false; }));
+    var localComplete = Boolean(titleStr && descStr && hasValidCover);
     var isComplete = backendComplete !== null ? (backendComplete && localComplete) : (missing.length === 0 && localComplete);
     if (!isComplete && !missing.length) {
       if (!titleStr) missing.push("标题");
       if (!descStr) missing.push("简介");
-      if (!imgs.length) missing.push("封面");
-      else if (imgs.some(function (img) { return img && img.exists === false; })) missing.push("封面（文件缺失）");
+      if (!isShortsPkg) {
+        if (hasBrokenImgs) missing.push("封面（文件缺失）");
+        else if (!hasAbPrompts && !imgs.length) missing.push("A/B 封面提示词");
+      }
     }
-    var hasAny = Boolean(titleStr || descStr || imgs.length);
+    var hasAny = Boolean(titleStr || descStr || imgs.length || hasAbPrompts);
     return {
       titleStr: titleStr,
       descStr: descStr,
@@ -687,12 +738,12 @@
     var parts = raw.split("/").filter(function (p) { return p !== ""; }).map(function (p) {
       try { return decodeURIComponent(p); } catch (_) { return p; }
     });
-    if (parts[0] === "topics" || parts[0] === "stories") {
+    if (parts[0] === "topics" || parts[0] === "stories" || parts[0] === "pipelines") {
       state.tab = parts[0];
     } else {
       state.tab = "analytics";
     }
-    if (state.tab === "analytics" || !parts[1]) {
+    if (state.tab === "analytics" || state.tab === "pipelines" || !parts[1]) {
       state.detail = null;
     } else if (state.tab === "stories") {
       var sub = parts[2] && SUBVIEW_KEY_MAP[parts[2]] ? SUBVIEW_KEY_MAP[parts[2]] : null;
@@ -724,6 +775,11 @@
       var badge = $("badge-" + k);
       if (badge) badge.textContent = c && c.pending ? String(c.pending) : "";
     });
+    var pipeBadge = $("badge-pipelines");
+    if (pipeBadge) {
+      var pipes = Array.isArray(state.data.pipelines) ? state.data.pipelines : [];
+      pipeBadge.textContent = pipes.length ? String(pipes.length) : "";
+    }
     $("demoNotice").hidden = !state.data.has_demo_items;
     if (state.detail) {
       var item = findItem(state.detail.type, state.detail.id);
@@ -754,8 +810,9 @@
   }
 
   var EMPTY_TEXT = {
-    topics: ["暂无候选题目", "完成预研并录入候选题后会显示在这里。"],
-    stories: ["暂无待确认故事", "作者选定题目、故事与预包装录入后会显示在这里。"]
+    topics: ["暂无候选题目", "完成预研并录入候选题后会显示在这里；09:05 待审少于 3 条时将自动补齐候选。"],
+    stories: ["暂无待确认故事", "作者选定题目、故事与预包装录入后会显示在这里。"],
+    pipelines: ["暂无在制项目进度", "选题通过或进入制作后，将在此以地铁图展示各阶段、专岗与分章真实进度。"]
   };
 
   function fmtInt(n) {
@@ -1306,7 +1363,7 @@
         )
       );
       var memGrid = el("div", "ana-mem-grid");
-      ["antigravity", "codex", "zoe-image", "tom-tts", "daniel-bgm", "neo-qc"].forEach(function (rk) {
+      ["antigravity", "rozi-packaging", "codex", "zoe-image", "tom-tts", "daniel-bgm", "neo-qc"].forEach(function (rk) {
         var info = agRec.agents[rk];
         if (!info) return;
         var mRow = el("div", "ana-mem-row");
@@ -1330,6 +1387,159 @@
     root.appendChild(page);
   }
 
+  function resolveStoryTitleByProjectId(projectId) {
+    if (!state.data || !projectId) return "";
+    var stories = state.data.stories || [];
+    for (var i = 0; i < stories.length; i++) {
+      if (stories[i] && stories[i].story_id === projectId) {
+        return resolveStoryVideoTitle(stories[i]);
+      }
+    }
+    var topics = state.data.topics || [];
+    for (var j = 0; j < topics.length; j++) {
+      if (topics[j] && topics[j].topic_id === projectId) {
+        return (topics[j].latest && topics[j].latest.title) || projectId;
+      }
+    }
+    return "";
+  }
+
+  function renderPipelinesTab(root) {
+    var pipes = (state.data && Array.isArray(state.data.pipelines)) ? state.data.pipelines.slice() : [];
+    if (!pipes.length) {
+      var e = el("div", "empty");
+      e.appendChild(el("strong", "", EMPTY_TEXT.pipelines[0]));
+      e.appendChild(el("span", "", EMPTY_TEXT.pipelines[1]));
+      root.appendChild(e);
+      return;
+    }
+    pipes.sort(function (a, b) {
+      var aHalt = a && a.status === "HALTED_ON_ERROR" ? 0 : 1;
+      var bHalt = b && b.status === "HALTED_ON_ERROR" ? 0 : 1;
+      if (aHalt !== bHalt) return aHalt - bHalt;
+      return String((b && b.updated_at) || "").localeCompare(String((a && a.updated_at) || ""));
+    });
+    var wrap = el("div", "pui-root");
+    pipes.forEach(function (p) {
+      var title = resolveStoryTitleByProjectId(p.project_id);
+      if (window.PipelineUI && typeof window.PipelineUI.renderSubwayPipeline === "function") {
+        window.PipelineUI.renderSubwayPipeline(wrap, p, { storyTitle: title });
+      }
+    });
+    root.appendChild(wrap);
+  }
+
+  function renderTopicCandidateCard(item) {
+    var latest = item.latest || {};
+    var isChecked = Boolean(item.is_approved);
+    var card = el("article", "topic-cand-card" + (isChecked ? " is-checked" : ""));
+
+    var titleRow = el("div", "topic-title-row");
+    var checkBtn = el("button", "topic-check-btn" + (isChecked ? " checked" : ""));
+    checkBtn.type = "button";
+    checkBtn.disabled = state.busy;
+    checkBtn.setAttribute("aria-pressed", isChecked ? "true" : "false");
+    checkBtn.setAttribute("aria-label", (isChecked ? "取消勾选：" : "勾选此题：") + (latest.title || item.topic_id));
+    var checkBox = el("span", "topic-check-box", isChecked ? "✓" : "");
+    checkBtn.appendChild(checkBox);
+    checkBtn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      if (state.busy) return;
+      submit(
+        {
+          type: "topic",
+          id: item.topic_id,
+          version: item.current_version,
+          action: isChecked ? "unselect" : "approve"
+        },
+        ""
+      );
+    });
+    titleRow.appendChild(checkBtn);
+    titleRow.appendChild(el("h3", "topic-cand-title", latest.title || item.topic_id));
+    if (isChecked) {
+      titleRow.appendChild(el("span", "topic-checked-pill", "已勾选"));
+    } else if (item.current_status === "feedback_submitted") {
+      titleRow.appendChild(statusPill("feedback_submitted", "已提意见"));
+    }
+    card.appendChild(titleRow);
+
+    if (latest.hook) {
+      card.appendChild(el("div", "topic-cand-hook", latest.hook));
+    }
+
+    if (latest.benchmark_video || latest.benchmark_reason || latest.benchmark_tag) {
+      var bBox = el("div", "topic-bench-box");
+      var bTop = el("div", "topic-bench-top");
+      if (latest.benchmark_tag) {
+        bTop.appendChild(el("span", "topic-bench-tag", latest.benchmark_tag));
+      }
+      if (latest.benchmark_video) {
+        bTop.appendChild(el("span", "muted", "对标："));
+        var bUrl = String(latest.benchmark_url || "");
+        if (bUrl.indexOf("https://www.youtube.com/") === 0 || bUrl.indexOf("https://youtu.be/") === 0) {
+          var aLink = el("a", "topic-bench-link", latest.benchmark_video);
+          aLink.href = bUrl;
+          aLink.target = "_blank";
+          aLink.rel = "noopener noreferrer";
+          aLink.addEventListener("click", function (ev) { ev.stopPropagation(); });
+          bTop.appendChild(aLink);
+        } else {
+          bTop.appendChild(el("strong", "", latest.benchmark_video));
+        }
+      }
+      bBox.appendChild(bTop);
+      if (latest.benchmark_reason) {
+        bBox.appendChild(el("div", "topic-bench-reason", "原因：" + latest.benchmark_reason));
+      }
+      card.appendChild(bBox);
+    }
+
+    card.addEventListener("click", function () {
+      go("topics/" + encodeURIComponent(item.topic_id));
+    });
+    return card;
+  }
+
+  function renderTopicsPartitioned(root, items) {
+    var visible = items.filter(function (t) { return t && t.current_status !== "rejected"; });
+    var longItems = [];
+    var shortItems = [];
+    visible.forEach(function (t) {
+      var fmt = String((t.latest && t.latest.video_format) || t.video_format || "long").toLowerCase();
+      if (fmt === "shorts") shortItems.push(t);
+      else longItems.push(t);
+    });
+
+    var longSec = el("section", "topic-zone zone-long");
+    var lHead = el("div", "topic-zone-head");
+    lHead.appendChild(el("h2", "topic-zone-title", "🎬 长视频候选（" + longItems.length + "）"));
+    lHead.appendChild(el("span", "topic-zone-sub", "点标题旁方框打勾 · 可先选储备，不强制发布"));
+    longSec.appendChild(lHead);
+    if (longItems.length) {
+      var lList = el("div", "topic-zone-list");
+      longItems.forEach(function (it) { lList.appendChild(renderTopicCandidateCard(it)); });
+      longSec.appendChild(lList);
+    } else {
+      longSec.appendChild(el("div", "muted small", "暂无长视频候选。"));
+    }
+    root.appendChild(longSec);
+
+    var shortSec = el("section", "topic-zone zone-shorts");
+    var sHead = el("div", "topic-zone-head");
+    sHead.appendChild(el("h2", "topic-zone-title", "⚡ 短视频 Shorts 候选（" + shortItems.length + "）"));
+    sHead.appendChild(el("span", "topic-zone-sub", "强制一天发一期 · 无需封面，打勾即选定"));
+    shortSec.appendChild(sHead);
+    if (shortItems.length) {
+      var sList = el("div", "topic-zone-list");
+      shortItems.forEach(function (it) { sList.appendChild(renderTopicCandidateCard(it)); });
+      shortSec.appendChild(sList);
+    } else {
+      shortSec.appendChild(el("div", "muted small", "暂无短视频候选。"));
+    }
+    root.appendChild(shortSec);
+  }
+
   function renderList() {
     var root = $("listView");
     root.textContent = "";
@@ -1337,12 +1547,27 @@
       renderAnalyticsBrief(root, state.data ? state.data.daily_analytics : null);
       return;
     }
+    if (state.tab === "pipelines") {
+      renderPipelinesTab(root);
+      return;
+    }
+    if (state.tab === "topics" && window.PipelineUI && typeof window.PipelineUI.renderRollingScheduleBanner === "function") {
+      window.PipelineUI.renderRollingScheduleBanner(
+        root,
+        state.data ? state.data.rolling_schedule : null,
+        state.data ? state.data.async_queue : null
+      );
+    }
     var items = state.data[state.tab] || [];
     if (!items.length) {
       var e = el("div", "empty");
       e.appendChild(el("strong", "", EMPTY_TEXT[state.tab][0]));
       e.appendChild(el("span", "", EMPTY_TEXT[state.tab][1]));
       root.appendChild(e);
+      return;
+    }
+    if (state.tab === "topics") {
+      renderTopicsPartitioned(root, items);
       return;
     }
     var order = { pending: 0, feedback_submitted: 1, approved: 2, rejected: 3 };
@@ -1519,12 +1744,20 @@
       statusText = "未提交";
     }
     headMeta.appendChild(statusPill(statusCode, statusText));
-    headMeta.appendChild(el("span", "pill ver", "Antigravity 成果"));
+    headMeta.appendChild(el("span", "pill ver", "Rozi 包装（长视频 A/B 封面提示词）"));
     headMeta.appendChild(el("span", "pill ver", "包装 v" + pkg.current_version));
+    if (pkg.primary_cover_variant) {
+      headMeta.appendChild(statusPill("approved", "首发主封面：" + pkg.primary_cover_variant + "（备用：" + (pkg.backup_cover_variant || (pkg.primary_cover_variant === "A" ? "B" : "A")) + "）"));
+    }
+    if (pkg.current_status === "feedback_submitted" && pkg.last_return_target) {
+      var rtLabel = pkg.last_return_target === "rozi_prompt" ? "已退回 Rozi 重出提示词" :
+        (pkg.last_return_target === "codex_typography" ? "已退回 Codex 微调排字" : "");
+      if (rtLabel) headMeta.appendChild(statusPill("feedback_submitted", rtLabel));
+    }
     if (pkg.is_demo) headMeta.appendChild(el("span", "pill demo", "测试示例"));
     box.appendChild(headMeta);
 
-    box.appendChild(el("h3", "", "Antigravity 预包装（标题、简介、封面）"));
+    box.appendChild(el("h3", "", "预包装（标题、简介、A/B 封面）"));
     renderVersionSwitch(box, pkg, "viewPackagingVersion");
     if (!isPkgLatest) {
       box.appendChild(el("div", "old-version-note", "正在查看预包装旧版本 v" + viewingPkgVer + "，只能阅读；决定只能针对最新版 v" + pkg.current_version + "。"));
@@ -1550,8 +1783,58 @@
       box.appendChild(el("div", "muted small", "未提交简介（缺字段）"));
     }
 
-    box.appendChild(el("div", "section-title", "封面"));
-    renderImages(box, evalRes.imgs, "未提交封面（缺字段）");
+    var cv = (pVer && pVer.cover_variants) || {};
+    var hasAB = Boolean(
+      (cv.A && (cv.A.image_prompt || cv.A.final_image || cv.A.clean_image || cv.A.main_text)) ||
+      (cv.B && (cv.B.image_prompt || cv.B.final_image || cv.B.clean_image || cv.B.main_text)) ||
+      (isPkgLatest && pkg.has_ab_variants)
+    );
+    if (hasAB && window.PipelineUI && typeof window.PipelineUI.renderCoverAB === "function") {
+      var abMount = window.PipelineUI.renderCoverAB(
+        box,
+        {
+          cover_variants: cv,
+          primary_cover_variant: isPkgLatest ? pkg.primary_cover_variant : (pVer.primary_cover_variant || null),
+          backup_cover_variant: isPkgLatest ? pkg.backup_cover_variant : null
+        },
+        {
+          readOnly: !isPkgLatest,
+          disabled: state.busy,
+          resolveMediaUrl: function (relPath) {
+            return "/api/media/" + String(relPath || "").replace(/^\/+/, "");
+          },
+          onSelectPrimary: function (sKey) {
+            var pId = pkg.packaging_id || pkg.story_id || storyItem.story_id;
+            submit({
+              type: "packaging",
+              id: pId,
+              version: pkg.current_version,
+              action: "set_primary_cover",
+              primaryVariant: sKey
+            }, "");
+          },
+          onReturnFeedback: function (retAction) {
+            openSheet("packaging", pkg, retAction, {
+              fallbackTitle: storyItem.latest && storyItem.latest.title,
+              seriesName: pkg.series_name || storyItem.series_name,
+              storyId: storyItem.story_id
+            });
+          }
+        }
+      );
+      if (isCloudMode() && abMount) {
+        var cloudImgs = abMount.querySelectorAll("img");
+        for (var ci = 0; ci < cloudImgs.length; ci++) {
+          var srcAttr = cloudImgs[ci].getAttribute("src") || "";
+          if (srcAttr.indexOf("/api/media/") === 0) {
+            loadCloudImage(cloudImgs[ci], srcAttr);
+          }
+        }
+      }
+    } else {
+      box.appendChild(el("div", "section-title", "封面"));
+      renderImages(box, evalRes.imgs, "未提交封面（缺字段）");
+    }
 
     renderHistory(box, pkg, "预包装决定与意见记录");
 
@@ -1747,6 +2030,14 @@
     entriesWrap.appendChild(cdxBtn);
 
     root.appendChild(entriesWrap);
+
+    var epPipe = findPipelineByProjectId(item.story_id);
+    if (epPipe && window.PipelineUI && typeof window.PipelineUI.renderSubwayPipeline === "function") {
+      var pipeWrap = el("div", "");
+      pipeWrap.style.marginTop = "14px";
+      window.PipelineUI.renderSubwayPipeline(pipeWrap, epPipe, { storyTitle: videoTitle });
+      root.appendChild(pipeWrap);
+    }
   }
 
   function renderDetail(type, item) {
@@ -1814,7 +2105,13 @@
     if (!isLatest) root.appendChild(el("div", "old-version-note", "正在查看旧版本 v" + viewing + "，只能阅读；决定只能针对最新版 v" + item.current_version + "。"));
     if (ver.change_note) root.appendChild(el("div", "muted small", "本版说明：" + ver.change_note));
 
-    addSection(root, "核心问题／切入点", ver.hook);
+    addSection(root, "核心切入点", ver.hook);
+    if (ver.benchmark_video || ver.benchmark_reason) {
+      var benchTxt = (ver.benchmark_tag ? ("【" + ver.benchmark_tag + "】") : "") +
+        (ver.benchmark_video ? ("对标视频：" + ver.benchmark_video + (ver.benchmark_url ? (" (" + ver.benchmark_url + ")") : "")) : "") +
+        (ver.benchmark_reason ? ("\n对标原因：" + ver.benchmark_reason) : "");
+      addSection(root, "真实对标与原因", benchTxt);
+    }
     addSection(root, "预研说明", ver.summary);
     addSection(root, "参考书目", ver.source_books);
     addSection(root, "建议排期", ver.suggested_schedule);
@@ -1866,10 +2163,10 @@
     }
     root.appendChild(bar);
     var note = {
-      topic: "选择题目后，后续进入故事撰写、预包装与导演设计；本页面不会自动开始制作。",
+      topic: "点击选择此题后将立即排入后台异步前期队列（不阻塞 HTTP）；未通过题目绝不启动写稿或制作。",
       packaging: incompletePkg
         ? "当前预包装缺少必填字段（" + (options.missingPackagingFields || []).join("、") + "），不能通过预包装；可直接提修改意见，不影响下方故事正文独立审核。"
-        : "独立审核 Antigravity 预包装（标题、简介、封面），与下方故事正文互不影响。",
+        : "独立审核预包装（标题、简介、A/B 封面），包装退回不会使已通过的故事或导演设计失效。",
       story: "独立审核 Antigravity 故事正文，不受上方预包装是否提交或是否通过影响。",
       design: isStale
         ? "当前导演设计已过期，禁止点击通过，但可直接提交修改意见；待更新版本后再审。"
@@ -1887,12 +2184,20 @@
 
   // ---------- 提交 ----------
   var sheetCtx = null;
+  function isCommentRequiredAction(act) {
+    return act === "request_changes" || act === "return_rozi_prompt" || act === "return_codex_typography";
+  }
+
   function openSheet(type, item, action, opts) {
     var options = opts || {};
     if (type === "packaging" && action === "approve") {
       var pkgEval = evaluatePackagingVersion(item.latest, item);
       if (options.incompletePackaging || !pkgEval.isComplete) {
         showBanner("预包装的标题、简介或封面尚未完整，不能通过预包装。", "err");
+        return;
+      }
+      if (Boolean(item.has_ab_variants) && !item.primary_cover_variant) {
+        showBanner("请先在上方 A/B 封面卡片上点击选定一张作为「首发主封面」，再点击通过预包装。", "err");
         return;
       }
     }
@@ -1904,7 +2209,7 @@
     var name = latest.packaging_title || latest.title || item.story_title || options.fallbackTitle || item[ID_KEY[type]] || item.story_id || "";
     var titles = {
       approve: {
-        topic: "确认选择这个题目？",
+        topic: "确认选择这个题目？（将放入后台异步队列）",
         packaging: "确认通过当前版预包装？",
         story: "确认通过当前版故事正文？",
         design: "确认通过当前版导演设计？"
@@ -1915,13 +2220,21 @@
         story: "对故事正文提出修改意见",
         design: "对导演设计提出修改意见"
       }[type] || "提出修改意见",
+      return_rozi_prompt: "退回 Rozi 重出封面英文提示词",
+      return_codex_typography: "仅让 Codex 微调封面排字位置",
       reject: "确认暂不采用这个题目？"
     };
     var itemId = type === "packaging"
       ? (item.packaging_id || item.story_id || options.storyId)
       : (type === "design" ? (item.design_id || item.story_id) : item[ID_KEY[type]]);
-    sheetCtx = { type: type, id: itemId, version: item.current_version, action: action };
-    $("sheetTitle").textContent = titles[action];
+    sheetCtx = {
+      type: type,
+      id: itemId,
+      version: item.current_version,
+      action: action,
+      primaryVariant: type === "packaging" ? (item.primary_cover_variant || null) : null
+    };
+    $("sheetTitle").textContent = titles[action] || "确认提交决定";
     var typeTag = {
       topic: "v",
       packaging: "预包装 v",
@@ -1933,10 +2246,17 @@
     var ta = $("sheetComment");
     ta.hidden = false;
     ta.value = "";
-    ta.placeholder = action === "request_changes" ? "请写具体修改意见（必填）" : "可选附言（例如：某处镜头或语气微调建议）";
-    $("sheetConfirm").textContent = action === "request_changes" ? "提交意见" : "确认";
+    var needComment = isCommentRequiredAction(action);
+    if (action === "return_rozi_prompt") {
+      ta.placeholder = "请写明构图、意象或视角重出方向（必填；已通过的故事与导演设计不受影响）";
+    } else if (action === "return_codex_typography") {
+      ta.placeholder = "请写明排字字号、留白位置或微调要求（必填；底图构图、已通过故事与导演设计不受影响）";
+    } else {
+      ta.placeholder = needComment ? "请写具体修改意见（必填）" : "可选附言（例如：某处镜头或语气微调建议）";
+    }
+    $("sheetConfirm").textContent = needComment ? "提交退回意见" : "确认";
     $("sheet").hidden = false;
-    if (action === "request_changes") setTimeout(function () { ta.focus(); }, 50);
+    if (needComment) setTimeout(function () { ta.focus(); }, 50);
   }
   function closeSheet() { $("sheet").hidden = true; sheetCtx = null; }
   $("sheetCancel").addEventListener("click", closeSheet);
@@ -1944,31 +2264,58 @@
   $("sheetConfirm").addEventListener("click", function () {
     if (!sheetCtx || state.busy) return;
     var comment = $("sheetComment").value.trim();
-    if (sheetCtx.action === "request_changes" && !comment) {
+    if (isCommentRequiredAction(sheetCtx.action) && !comment) {
       $("sheetComment").focus();
-      showBanner("修改意见不能为空。", "err");
+      showBanner("退回或修改意见不能为空。", "err");
       return;
     }
     submit(sheetCtx, comment);
   });
 
+  function resolveSuccessMessage(ctx, deduplicated) {
+    if (deduplicated) return "这条决定之前已保存，未重复记录。";
+    if (ctx.type === "topic" && ctx.action === "approve") {
+      return "✓ 已勾选此题（长视频仅做储备不强制发，Shorts 按每日一期排产）。";
+    }
+    if (ctx.type === "topic" && ctx.action === "unselect") {
+      return "已取消勾选，恢复为待选状态。";
+    }
+    if (ctx.type === "packaging" && ctx.action === "set_primary_cover") {
+      var bk = ctx.primaryVariant === "A" ? "B" : "A";
+      return "已将方案 " + ctx.primaryVariant + " 设为「首发主封面」，方案 " + bk + " 保留为「CTR 迭代备用封面」。";
+    }
+    if (ctx.type === "packaging" && ctx.action === "return_rozi_prompt") {
+      return "已退回 Rozi 重出提示词；已通过的故事正文与导演设计不受影响。";
+    }
+    if (ctx.type === "packaging" && ctx.action === "return_codex_typography") {
+      return "已记录仅让 Codex 微调排字位置；已通过的故事正文与导演设计不受影响。";
+    }
+    return "已保存。下次读取时会看到更新；页面不会自动通知或擅自推进制作。";
+  }
+
   function submit(ctx, comment) {
-    var key = [ctx.type, ctx.id, ctx.version, ctx.action, comment].join("|");
+    var key = [ctx.type, ctx.id, ctx.version, ctx.action, ctx.primaryVariant || "", comment].join("|");
     if (!pendingRequestIds[key]) pendingRequestIds[key] = randomId();
     state.busy = true;
     $("sheetConfirm").disabled = true;
+    var postBody = {
+      item_type: ctx.type,
+      item_id: ctx.id,
+      target_version: ctx.version,
+      action: ctx.action,
+      comment: comment,
+      request_id: pendingRequestIds[key]
+    };
+    if (ctx.primaryVariant) postBody.primary_variant = ctx.primaryVariant;
     var reqPromise = isCloudMode()
       ? cloudSubmitDecision(ctx, comment, pendingRequestIds[key])
-      : api("POST", "/api/decision", {
-          item_type: ctx.type, item_id: ctx.id, target_version: ctx.version,
-          action: ctx.action, comment: comment, request_id: pendingRequestIds[key]
-        });
+      : api("POST", "/api/decision", postBody);
     reqPromise.then(function (j) {
       if (j.ok) {
         delete pendingRequestIds[key];
         state.data = j.data;
         closeSheet();
-        showBanner(j.deduplicated ? "这条决定之前已保存，未重复记录。" : "已保存。下次读取时会看到更新；页面不会自动通知或推进制作。", "ok");
+        showBanner(resolveSuccessMessage(ctx, j.deduplicated), "ok");
         render();
       } else if (j._status === 409) {
         delete pendingRequestIds[key];
