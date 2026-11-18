@@ -168,7 +168,11 @@
       ".pui-btn:disabled { opacity: 0.55; cursor: not-allowed; }",
       ".pui-btn-primary { background: var(--ok, #2f6b3c); color: #fff; }",
       ".pui-btn-warn { background: var(--warn-bg, #fbf0dd); color: var(--warn, #9a5b12); border-color: rgba(154,91,18,0.3); }",
-      ".pui-btn-ghost { background: var(--card, #fffdf8); color: var(--ink, #1c1d21); border-color: var(--line, #e2ddd2); }"
+      ".pui-btn-ghost { background: var(--card, #fffdf8); color: var(--ink, #1c1d21); border-color: var(--line, #e2ddd2); }",
+      ".pui-start-voice-bar { margin: 0 0 12px; padding: 12px; border-radius: 10px; border: 1.5px solid var(--ok, #2f6b3c); background: var(--ok-bg, #e5f1e6); display: flex; flex-direction: column; gap: 6px; }",
+      ".pui-start-voice-btn { width: 100%; background: var(--ok, #2f6b3c); color: #fff; font-size: 15px; font-weight: 800; }",
+      ".pui-start-voice-note { font-size: 12px; line-height: 1.45; color: var(--ink, #1c1d21); word-break: break-word; }",
+      ".pui-start-voice-queued { font-size: 13px; font-weight: 700; color: var(--ok, #2f6b3c); line-height: 1.45; word-break: break-word; }"
     ];
 
     var styleNode = document.createElement("style");
@@ -243,7 +247,7 @@
     { key: "TOPIC_PROPOSED", name: "选题与排期提报待审（或作者手动直提新故事）", owner: "Rozi → 作者审核" },
     { key: "TOPIC_APPROVED", name: "选题已通过（已入异步队列）", owner: "作者审批" },
     { key: "PREPROD_RUNNING", name: "前期撰稿 · Rozi 包装（长片 A/B 封面提示词） · 导演设计", owner: "AGY + Rozi + Codex" },
-    { key: "GATE_CONTENT_AND_BUDGET", name: "三项独立审核与付费预算关口", owner: "作者门禁" },
+    { key: "GATE_CONTENT_AND_BUDGET", name: "三项独立审核与「开始配音」关口", owner: "作者门禁" },
     { key: "PROD_STAGE5_PARALLEL", name: "阶段 5 并行资产生产（配音时轴 ＋ 生图）", owner: "Tom + Zoe" },
     { key: "PROD_PRE_RENDER_GATE", name: "渲染前汇合质检闸门（Pre-Render Gate）", owner: "Neo QC" },
     { key: "PROD_STAGE6_SYNTHESIS", name: "阶段 6 配乐校准与分章视频合成", owner: "Daniel + AGY" },
@@ -327,7 +331,9 @@
       var detail = "";
       var subtasks = [];
       if (def.key === "PREPROD_RUNNING") {
+        subtasks.push(buildRoleSubtask(roles.antigravity, "AGY · 调研与故事"));
         subtasks.push(buildRoleSubtask(roles.rozi, "选题与包装专员 Rozi"));
+        subtasks.push(buildRoleSubtask(roles.codex, "Codex · 导演设计"));
         detail = "故事 v" + safeText(p.script_version, "未知") +
           " · 预包装 v" + safeText(p.packaging_version, "未知") +
           " · 导演设计 v" + safeText(p.design_version, "未知");
@@ -339,10 +345,10 @@
             stLabel = "单集特批放行（通用门禁不变）";
             detail = "作者单集例外：" + safeText(exc.reason, "预包装暂缓，本集先行制作") + "（仅限本集）";
           } else {
-            detail = "三项审核与预算核验已记录";
+            detail = "三项审核与「开始配音」指令核验已记录";
           }
         } else {
-          detail = "须故事、预包装、导演设计独立审核通过且收费预算获批";
+          detail = "预包装、故事正文、导演设计三项审核通过后，须由作者明确点击「开始配音」指令才启动阶段 5（免逐集配音预算审批）";
         }
       } else if (def.key === "PROD_STAGE5_PARALLEL") {
         subtasks.push(buildRoleSubtask(roles.tom, "配音与时轴专员 Tom"));
@@ -390,7 +396,7 @@
       breaker = {
         stage: hi.interrupted_stage_label || hi.interrupted_stage || "未知环节",
         error_code: hi.error_type || hi.error_code || (hi.http_status ? ("HTTP " + hi.http_status) : "未知"),
-        request_id: hi.request_id || hi.log_id || "未知",
+        request_id: hi.log_id || hi.request_id || "未知",
         has_submit_lock: true,
         timestamp: hi.halted_at || p.updated_at,
         is_paid_service: true,
@@ -405,7 +411,7 @@
     var rawDenied = Array.isArray(p.denied_actions) && p.denied_actions.length
       ? p.denied_actions
       : (haltInfo && Array.isArray(haltInfo.denied_actions) ? haltInfo.denied_actions : []);
-    var latestReqOrLog = p.last_request_id || p.last_log_id || (haltInfo && (haltInfo.request_id || haltInfo.log_id)) || null;
+    var latestReqOrLog = p.last_log_id || p.last_request_id || (haltInfo && (haltInfo.log_id || haltInfo.request_id)) || null;
 
     return {
       project_id: safeText(p.project_id, "未知"),
@@ -510,6 +516,72 @@
 
     if (data.circuit_breaker) {
       renderCircuitBreaker(card, data.circuit_breaker, opts.circuitBreakerOptions);
+    }
+
+    if (String(raw.status || "") === "GATE_CONTENT_AND_BUDGET") {
+      var voiceBar = el("div", "pui-start-voice-bar");
+      var btnRow = el("div", "");
+      btnRow.style.display = "flex";
+      btnRow.style.flexWrap = "wrap";
+      btnRow.style.gap = "8px";
+      btnRow.style.alignItems = "center";
+
+      if (opts.canApproveAll) {
+        var appAllBtn = el("button", "pui-btn pui-btn-primary", "✓ 一键三项全通过");
+        appAllBtn.type = "button";
+        appAllBtn.setAttribute("data-action", "approve-all-three");
+        appAllBtn.disabled = Boolean(opts.disabled);
+        appAllBtn.addEventListener("click", function () {
+          if (typeof opts.onApproveAllThree === "function") {
+            opts.onApproveAllThree();
+          }
+        });
+        btnRow.appendChild(appAllBtn);
+      } else if (opts.canStartVoice) {
+        var doneBadge = el("span", "pui-pill pui-st-completed", "✓ 三项审核已全部通过");
+        btnRow.appendChild(doneBadge);
+      }
+
+      if (opts.voiceQueuedTask) {
+        btnRow.appendChild(
+          el(
+            "div",
+            "pui-start-voice-queued",
+            "🎙️ 已下达「开始配音」明确指令（队列任务 " +
+              safeText(opts.voiceQueuedTask.task_id, "未知") +
+              " · 状态：" +
+              safeText(opts.voiceQueuedTask.status, "queued") +
+              "）"
+          )
+        );
+      } else {
+        var vLabel = opts.canStartVoice ? "🎙️ 开始配音" : "🎙️ 开始配音（三项全通过后解锁）";
+        var vBtn = el("button", "pui-btn pui-start-voice-btn", vLabel);
+        vBtn.type = "button";
+        vBtn.setAttribute("data-action", "start-voice");
+        vBtn.disabled = Boolean(opts.disabled) || !opts.canStartVoice;
+        if (!opts.canStartVoice) {
+          vBtn.style.opacity = "0.55";
+          vBtn.style.cursor = "not-allowed";
+        }
+        vBtn.addEventListener("click", function () {
+          if (opts.canStartVoice && typeof opts.onStartVoice === "function") {
+            opts.onStartVoice();
+          }
+        });
+        btnRow.appendChild(vBtn);
+      }
+      voiceBar.appendChild(btnRow);
+      voiceBar.appendChild(
+        el(
+          "div",
+          "pui-start-voice-note",
+          opts.canStartVoice
+            ? "三项审核均已通过（A1 豆包配音免逐集预算审批）；点击「🎙️ 开始配音」即向制作队列写入 task_type=production_start 并记录作者明确开配指令。"
+            : "当前尚有待审项（如预包装未点通过）；请先点击左侧「✓ 一键三项全通过」，即可立即解锁「🎙️ 开始配音」按钮。"
+        )
+      );
+      card.appendChild(voiceBar);
     }
 
     var denied = Array.isArray(data.denied_actions) ? data.denied_actions : [];

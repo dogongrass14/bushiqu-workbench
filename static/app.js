@@ -309,6 +309,7 @@
       return_rozi_prompt: "feedback_submitted",
       return_codex_typography: "feedback_submitted",
       set_primary_cover: target.current_status || "pending",
+      start_voice: target.current_status || "approved",
       reject: "rejected"
     };
     var statusLabelMap = { approved: "已通过", feedback_submitted: "作者已反馈", rejected: "暂不采用", pending: "未确认" };
@@ -319,6 +320,7 @@
       return_rozi_prompt: "退回 Rozi 重出提示词",
       return_codex_typography: "仅让 Codex 微调排字位置",
       set_primary_cover: "选定首发主封面",
+      start_voice: "开始配音",
       reject: "暂不采用"
     };
     var statusAfter = statusMap[ctx.action] || "pending";
@@ -332,17 +334,37 @@
     else if (ctx.action === "return_codex_typography") target.last_return_target = "codex_typography";
     else if (ctx.action === "approve") target.last_return_target = null;
 
-    hist.push({
-      event_id: "cloud_" + reqId,
-      request_id: reqId,
-      version: target.current_version,
-      action: ctx.action,
-      action_label: actionLabelMap[ctx.action] || ctx.action,
-      status_after: statusAfter,
-      status_after_label: statusLabelMap[statusAfter] || statusAfter,
-      comment: comment,
-      created_at: nowStr
-    });
+    if (ctx.action === "start_voice") {
+      if (!snap.async_queue || typeof snap.async_queue !== "object") {
+        snap.async_queue = { updated_at: nowStr, tasks: [] };
+      }
+      if (!Array.isArray(snap.async_queue.tasks)) snap.async_queue.tasks = [];
+      snap.async_queue.tasks.push({
+        task_id: "qprod_cloud_" + reqId,
+        task_type: "production_start",
+        project_id: ctx.id,
+        story_id: ctx.id,
+        story_version: ctx.version,
+        author_explicit_command: true,
+        command_name: "开始配音",
+        request_id: reqId,
+        status: "queued",
+        enqueued_at: nowStr,
+        updated_at: nowStr
+      });
+    } else {
+      hist.push({
+        event_id: "cloud_" + reqId,
+        request_id: reqId,
+        version: target.current_version,
+        action: ctx.action,
+        action_label: actionLabelMap[ctx.action] || ctx.action,
+        status_after: statusAfter,
+        status_after_label: statusLabelMap[statusAfter] || statusAfter,
+        comment: comment,
+        created_at: nowStr
+      });
+    }
     target.current_status = statusAfter;
     target.raw_status_label = statusLabelMap[statusAfter] || statusAfter;
     target.status_label = statusLabelMap[statusAfter] || statusAfter;
@@ -677,10 +699,12 @@
   function getStoryGateStatuses(storyItem) {
     var pkg = findLatestPackagingByStoryId(storyItem.story_id);
     var pkgApproved = false;
+    var pkgComplete = false;
     var pkgDetail = "未提交";
     if (pkg) {
       var pkgEval = evaluatePackagingVersion(pkg.latest, pkg);
-      pkgApproved = Boolean(pkg.is_approved && pkgEval.isComplete);
+      pkgComplete = Boolean(pkgEval.isComplete);
+      pkgApproved = Boolean(pkg.is_approved && pkgComplete);
       if (pkgApproved) {
         pkgDetail = "已通过（v" + pkg.current_version + "）";
       } else if (!pkgEval.hasAny) {
@@ -696,16 +720,23 @@
       pkgDetail = "未通过（未提交）";
     }
 
-    var storyApproved = Boolean(storyItem.is_approved);
+    var sLatest = (storyItem && storyItem.latest) || {};
+    var sContent = typeof sLatest.content === "string" ? sLatest.content.trim() : (typeof storyItem.content === "string" ? storyItem.content.trim() : "");
+    var storyComplete = Boolean(sContent);
+    var storyApproved = Boolean(storyItem.is_approved && storyComplete);
     var storyDetail = storyApproved
       ? "已通过（v" + storyItem.current_version + "）"
       : "未通过（" + storyStatusLabel(storyItem) + " · v" + storyItem.current_version + "）";
 
     var design = findLatestDesignByStoryId(storyItem.story_id);
     var designApproved = false;
+    var designComplete = false;
     var designDetail = "未通过（未提交）";
     if (design) {
       var isStale = Boolean(design.is_stale || design.stale);
+      var dLatest = design.latest || {};
+      var dContent = typeof dLatest.content === "string" ? dLatest.content.trim() : (typeof design.content === "string" ? design.content.trim() : "");
+      designComplete = Boolean(!isStale && dContent);
       designApproved = Boolean(design.is_approved && !isStale);
       if (designApproved) {
         designDetail = "已通过（v" + design.current_version + "）";
@@ -716,10 +747,16 @@
       }
     }
 
+    var allThreeComplete = Boolean(pkgComplete && storyComplete && designComplete);
+    var allThreeApproved = Boolean(pkgApproved && storyApproved && designApproved);
+
     return {
-      packaging: { approved: pkgApproved, pillText: pkgApproved ? "预包装：已通过" : "预包装：未通过", detailText: pkgDetail },
-      story: { approved: storyApproved, pillText: storyApproved ? "故事：已通过" : "故事：未通过", detailText: storyDetail },
-      design: { approved: designApproved, pillText: designApproved ? "导演设计：已通过" : "导演设计：未通过", detailText: designDetail }
+      packaging: { approved: pkgApproved, complete: pkgComplete, item: pkg, pillText: pkgApproved ? "预包装：已通过" : "预包装：未通过", detailText: pkgDetail },
+      story: { approved: storyApproved, complete: storyComplete, item: storyItem, pillText: storyApproved ? "故事：已通过" : "故事：未通过", detailText: storyDetail },
+      design: { approved: designApproved, complete: designComplete, item: design, pillText: designApproved ? "导演设计：已通过" : "导演设计：未通过", detailText: designDetail },
+      allThreeComplete: allThreeComplete,
+      allThreeApproved: allThreeApproved,
+      canApproveAll: Boolean(allThreeComplete && !allThreeApproved)
     };
   }
 
@@ -1404,8 +1441,73 @@
     return "";
   }
 
+  function findStoryById(storyId) {
+    if (!state.data || !storyId) return null;
+    var stories = state.data.stories || [];
+    for (var i = 0; i < stories.length; i++) {
+      if (stories[i] && stories[i].story_id === storyId) return stories[i];
+    }
+    return null;
+  }
+
+  function findProductionStartTask(projectId) {
+    if (!state.data || !projectId) return null;
+    var queue = ((state.data || {}).async_queue || {}).tasks || [];
+    for (var i = queue.length - 1; i >= 0; i--) {
+      var t = queue[i];
+      if (
+        t &&
+        t.task_type === "production_start" &&
+        (t.project_id === projectId || t.story_id === projectId) &&
+        (t.status === "queued" || t.status === "running" || t.status === "completed")
+      ) {
+        return t;
+      }
+    }
+    return null;
+  }
+
+  function buildSubwayOptionsForProject(projectId, storyTitle) {
+    var storyObj = findStoryById(projectId);
+    var gates = storyObj ? getStoryGateStatuses(storyObj) : null;
+    var canStartVoice = Boolean(gates && gates.allThreeApproved);
+    var canApproveAll = Boolean(gates && gates.canApproveAll);
+    return {
+      storyTitle: storyTitle || resolveStoryTitleByProjectId(projectId),
+      canStartVoice: canStartVoice,
+      canApproveAll: canApproveAll,
+      disabled: Boolean(state.busy),
+      voiceQueuedTask: findProductionStartTask(projectId),
+      onApproveAllThree: function () {
+        if (storyObj && gates) approveAllThree(storyObj, gates);
+      },
+      onStartVoice: function () {
+        if (storyObj) startVoiceProduction(storyObj);
+      }
+    };
+  }
+
+  function startVoiceProduction(storyItem) {
+    if (!storyItem || state.busy) return;
+    submit(
+      {
+        type: "story",
+        id: storyItem.story_id,
+        version: storyItem.current_version,
+        action: "start_voice"
+      },
+      "作者明确下达「开始配音」指令"
+    );
+  }
+
   function renderPipelinesTab(root) {
     var pipes = (state.data && Array.isArray(state.data.pipelines)) ? state.data.pipelines.slice() : [];
+    var worker = (state.data && state.data.preprod_worker) || {};
+    if (worker.circuit) {
+      root.appendChild(el("div", "banner err", "自动前期已暂停：" +
+        (worker.circuit.http_status ? "HTTP " + worker.circuit.http_status + " · " : "") +
+        "上游模型调用失败，后续选题仍保留审批并排队等待，未继续发出模型请求。"));
+    }
     if (!pipes.length) {
       var e = el("div", "empty");
       e.appendChild(el("strong", "", EMPTY_TEXT.pipelines[0]));
@@ -1422,8 +1524,16 @@
     var wrap = el("div", "pui-root");
     pipes.forEach(function (p) {
       var title = resolveStoryTitleByProjectId(p.project_id);
+      var queue = ((state.data || {}).async_queue || {}).tasks || [];
+      for (var i = queue.length - 1; i >= 0; i--) {
+        if (queue[i].topic_id === p.project_id && queue[i].status === "queued") {
+          wrap.appendChild(el("p", "muted", title + "：" +
+            (worker.circuit ? "因上游熔断等待，尚未调用模型。" : "已批准，等待后台按顺序领取。")));
+          break;
+        }
+      }
       if (window.PipelineUI && typeof window.PipelineUI.renderSubwayPipeline === "function") {
-        window.PipelineUI.renderSubwayPipeline(wrap, p, { storyTitle: title });
+        window.PipelineUI.renderSubwayPipeline(wrap, p, buildSubwayOptionsForProject(p.project_id, title));
       }
     });
     root.appendChild(wrap);
@@ -1580,18 +1690,24 @@
       card.type = "button";
       var latest = item.latest || {};
       if (type === "story") {
+        var sCard = el("div", "card");
+        sCard.style.cursor = "pointer";
         var unitText = resolveStoryUnitText(item);
         var epText = resolveStoryEpisodeText(item);
         var videoTitle = resolveStoryVideoTitle(item);
         var stats = resolveStoryCountAndDuration(item);
+        var sGates = getStoryGateStatuses(item);
 
         var storyMeta = el("div", "meta story-list-meta");
         storyMeta.appendChild(el("span", "pill series", "单元：" + unitText));
         storyMeta.appendChild(el("span", "pill ver", "集数：" + epText));
         if (item.is_demo) storyMeta.appendChild(el("span", "pill demo", "测试示例"));
-        card.appendChild(storyMeta);
+        storyMeta.appendChild(statusPill(sGates.packaging.approved ? "approved" : "pending", sGates.packaging.pillText));
+        storyMeta.appendChild(statusPill(sGates.story.approved ? "approved" : "pending", sGates.story.pillText));
+        storyMeta.appendChild(statusPill(sGates.design.approved ? "approved" : "pending", sGates.design.pillText));
+        sCard.appendChild(storyMeta);
 
-        card.appendChild(el("h3", "", "视频标题：" + videoTitle));
+        sCard.appendChild(el("h3", "", "视频标题：" + videoTitle));
 
         var infoList = el("div", "story-card-fields");
         var fCount = el("div", "story-field-item");
@@ -1603,10 +1719,44 @@
         fDur.appendChild(el("span", "muted", "估计时长："));
         fDur.appendChild(el("span", "", stats.estDurationText));
         infoList.appendChild(fDur);
-        card.appendChild(infoList);
+        sCard.appendChild(infoList);
 
-        card.addEventListener("click", function () { go("stories/" + encodeURIComponent(item.story_id)); });
-        root.appendChild(card);
+        var quickBar = el("div", "hub-approve-all-top");
+        quickBar.style.marginTop = "10px";
+        quickBar.style.flexWrap = "wrap";
+        if (sGates.canApproveAll) {
+          var qBatchBtn = el("button", "btn primary hub-approve-all-btn", "✓ 一键三项全通过");
+          qBatchBtn.type = "button";
+          qBatchBtn.disabled = Boolean(state.busy);
+          qBatchBtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            approveAllThree(item, sGates);
+          });
+          quickBar.appendChild(qBatchBtn);
+        }
+        var qVoiceTask = findProductionStartTask(item.story_id);
+        if (qVoiceTask) {
+          quickBar.appendChild(
+            el("span", "pill approved", "🎙️ 已下达开始配音（" + qVoiceTask.status + "）")
+          );
+        } else {
+          var qVoiceLabel = sGates.allThreeApproved ? "🎙️ 开始配音" : "🎙️ 开始配音（三项全通过后解锁）";
+          var qVoiceBtn = el("button", "btn primary hub-approve-all-btn", qVoiceLabel);
+          qVoiceBtn.type = "button";
+          qVoiceBtn.disabled = Boolean(state.busy) || !sGates.allThreeApproved;
+          if (!sGates.allThreeApproved) {
+            qVoiceBtn.style.opacity = "0.55";
+          }
+          qVoiceBtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            if (sGates.allThreeApproved) startVoiceProduction(item);
+          });
+          quickBar.appendChild(qVoiceBtn);
+        }
+        sCard.appendChild(quickBar);
+
+        sCard.addEventListener("click", function () { go("stories/" + encodeURIComponent(item.story_id)); });
+        root.appendChild(sCard);
         return;
       }
 
@@ -1992,6 +2142,57 @@
     statusOverview.appendChild(statusPill(gates.design.approved ? "approved" : "pending", gates.design.pillText));
     root.appendChild(statusOverview);
 
+    var batchBar = el("div", "card hub-approve-all-bar");
+    var batchTop = el("div", "hub-approve-all-top");
+    batchTop.style.flexWrap = "wrap";
+    if (gates.canApproveAll) {
+      var batchBtn = el("button", "btn primary hub-approve-all-btn", "✓ 一键三项全通过");
+      batchBtn.type = "button";
+      batchBtn.id = "approveAllThreeBtn";
+      batchBtn.disabled = Boolean(state.busy);
+      batchBtn.addEventListener("click", function () {
+        approveAllThree(item, gates);
+      });
+      batchTop.appendChild(batchBtn);
+    } else if (gates.allThreeApproved) {
+      batchTop.appendChild(statusPill("approved", "✓ 三项审核已全部通过"));
+    }
+
+    var hubVoiceTask = findProductionStartTask(item.story_id);
+    if (hubVoiceTask) {
+      batchTop.appendChild(
+        el(
+          "div",
+          "muted small",
+          "🎙️ 已下达「开始配音」明确指令（任务 " + hubVoiceTask.task_id + " · 状态：" + hubVoiceTask.status + "）"
+        )
+      );
+    } else {
+      var hubVoiceLabel = gates.allThreeApproved ? "🎙️ 开始配音" : "🎙️ 开始配音（三项全通过后解锁）";
+      var hubVoiceBtn = el("button", "btn primary hub-approve-all-btn", hubVoiceLabel);
+      hubVoiceBtn.type = "button";
+      hubVoiceBtn.id = "startVoiceBtn";
+      hubVoiceBtn.disabled = Boolean(state.busy) || !gates.allThreeApproved;
+      if (!gates.allThreeApproved) {
+        hubVoiceBtn.style.opacity = "0.55";
+      }
+      hubVoiceBtn.addEventListener("click", function () {
+        if (gates.allThreeApproved) startVoiceProduction(item);
+      });
+      batchTop.appendChild(hubVoiceBtn);
+    }
+    batchBar.appendChild(batchTop);
+    batchBar.appendChild(
+      el(
+        "div",
+        "muted small hub-approve-all-note",
+        gates.allThreeApproved
+          ? "三项审核均已通过（免逐集配音预算审批）；点击「🎙️ 开始配音」即向制作队列写入 task_type=production_start 并记录作者明确开配指令。"
+          : "预包装、故事正文、导演设计三项状态仍独立存储、可单独退回；先点「✓ 一键三项全通过」即可立即解锁「🎙️ 开始配音」。"
+      )
+    );
+    root.appendChild(batchBar);
+
     var entriesWrap = el("div", "hub-entries");
 
     // 二级入口 1：Antigravity 成果（预包装与故事）
@@ -2032,10 +2233,39 @@
     root.appendChild(entriesWrap);
 
     var epPipe = findPipelineByProjectId(item.story_id);
+    if (gates.allThreeApproved && (!epPipe || epPipe.status !== "GATE_CONTENT_AND_BUDGET")) {
+      var vTask = findProductionStartTask(item.story_id);
+      var voiceCard = el("div", "card hub-approve-all-bar");
+      if (vTask) {
+        voiceCard.appendChild(
+          el(
+            "div",
+            "muted small",
+            "🎙️ 已下达「开始配音」明确指令（任务 " + vTask.task_id + " · 状态：" + vTask.status + "）"
+          )
+        );
+      } else {
+        var vBtn = el("button", "btn primary hub-approve-all-btn", "🎙️ 开始配音");
+        vBtn.type = "button";
+        vBtn.disabled = Boolean(state.busy);
+        vBtn.addEventListener("click", function () {
+          startVoiceProduction(item);
+        });
+        voiceCard.appendChild(vBtn);
+        voiceCard.appendChild(
+          el(
+            "div",
+            "muted small hub-approve-all-note",
+            "三项审核均已通过（免逐集配音预算审批）；点击即向制作队列写入 task_type=production_start 并记录作者明确开配指令。"
+          )
+        );
+      }
+      root.appendChild(voiceCard);
+    }
     if (epPipe && window.PipelineUI && typeof window.PipelineUI.renderSubwayPipeline === "function") {
       var pipeWrap = el("div", "");
       pipeWrap.style.marginTop = "14px";
-      window.PipelineUI.renderSubwayPipeline(pipeWrap, epPipe, { storyTitle: videoTitle });
+      window.PipelineUI.renderSubwayPipeline(pipeWrap, epPipe, buildSubwayOptionsForProject(item.story_id, videoTitle));
       root.appendChild(pipeWrap);
     }
   }
@@ -2280,6 +2510,9 @@
     if (ctx.type === "topic" && ctx.action === "unselect") {
       return "已取消勾选，恢复为待选状态。";
     }
+    if (ctx.type === "story" && ctx.action === "start_voice") {
+      return "🎙️ 已记录「开始配音」明确指令，已排入制作队列 (task_type=production_start)。";
+    }
     if (ctx.type === "packaging" && ctx.action === "set_primary_cover") {
       var bk = ctx.primaryVariant === "A" ? "B" : "A";
       return "已将方案 " + ctx.primaryVariant + " 设为「首发主封面」，方案 " + bk + " 保留为「CTR 迭代备用封面」。";
@@ -2291,6 +2524,104 @@
       return "已记录仅让 Codex 微调排字位置；已通过的故事正文与导演设计不受影响。";
     }
     return "已保存。下次读取时会看到更新；页面不会自动通知或擅自推进制作。";
+  }
+
+  function approveAllThree(storyItem, gates) {
+    if (state.busy) return;
+    var pkg = gates.packaging.item;
+    var design = gates.design.item;
+    if (!pkg || !storyItem || !design) {
+      showBanner("三项内容尚未齐备，不能一键全通过。", "err");
+      return;
+    }
+    var steps = [];
+    if (!gates.packaging.approved) {
+      var hasAb = Boolean(
+        pkg.has_ab_variants ||
+        (pkg.latest && pkg.latest.cover_variants && pkg.latest.cover_variants.A && pkg.latest.cover_variants.B)
+      );
+      steps.push({
+        label: "预包装",
+        type: "packaging",
+        id: pkg.packaging_id || pkg.story_id || storyItem.story_id,
+        version: pkg.current_version,
+        action: "approve",
+        primaryVariant: pkg.primary_cover_variant || (hasAb ? "A" : null)
+      });
+    }
+    if (!gates.story.approved) {
+      steps.push({
+        label: "故事正文",
+        type: "story",
+        id: storyItem.story_id,
+        version: storyItem.current_version,
+        action: "approve",
+        primaryVariant: null
+      });
+    }
+    if (!gates.design.approved) {
+      steps.push({
+        label: "导演设计",
+        type: "design",
+        id: design.design_id || design.story_id || storyItem.story_id,
+        version: design.current_version,
+        action: "approve",
+        primaryVariant: null
+      });
+    }
+    if (!steps.length) return;
+
+    state.busy = true;
+    render();
+    var succeeded = [];
+    var idx = 0;
+
+    function runNext() {
+      if (idx >= steps.length) {
+        state.busy = false;
+        showBanner("✓ 已一键通过：" + succeeded.join("、") + "（三项状态仍独立存储）。", "ok");
+        render();
+        return;
+      }
+      var st = steps[idx++];
+      var key = ["batch_approve", st.type, st.id, st.version, st.action, st.primaryVariant || ""].join("|");
+      if (!pendingRequestIds[key]) pendingRequestIds[key] = randomId();
+      var reqId = pendingRequestIds[key];
+      var postBody = {
+        item_type: st.type,
+        item_id: st.id,
+        target_version: st.version,
+        action: st.action,
+        comment: "一键三项全通过",
+        request_id: reqId
+      };
+      if (st.primaryVariant) postBody.primary_variant = st.primaryVariant;
+      var p = isCloudMode()
+        ? cloudSubmitDecision(st, "一键三项全通过", reqId)
+        : api("POST", "/api/decision", postBody);
+      p.then(function (j) {
+        if (j && j.ok) {
+          delete pendingRequestIds[key];
+          if (j.data) state.data = j.data;
+          succeeded.push(st.label);
+          runNext();
+        } else {
+          state.busy = false;
+          if (j && j.data) state.data = j.data;
+          var errMsg = (j && j.message) || "提交失败";
+          var doneNote = succeeded.length ? ("（已通过：" + succeeded.join("、") + "）") : "";
+          showBanner("「" + st.label + "」未通过：" + errMsg + doneNote, "err");
+          render();
+        }
+      }).catch(function () {
+        state.busy = false;
+        var doneNote = succeeded.length ? ("（已通过：" + succeeded.join("、") + "）") : "";
+        showBanner("「" + st.label + "」网络中断，未确认是否保存" + doneNote, "err");
+        render();
+      });
+    }
+
+    runNext();
   }
 
   function submit(ctx, comment) {
@@ -2347,6 +2678,13 @@
     tabs[i].addEventListener("click", function () { go(this.dataset.tab); });
   }
   $("refreshBtn").addEventListener("click", function () { load(false); });
+  // Only refresh the live local progress board; never interrupt reading or an approval form.
+  setInterval(function () {
+    if (!isCloudMode() && !document.hidden && state.tab === "pipelines" &&
+        !state.busy && !inFlightLoad && $("sheet").hidden) {
+      load(true);
+    }
+  }, 10000);
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden && !state.busy && $("sheet").hidden && (Date.now() - lastLoadOkAt > 20000)) {
       load(true);

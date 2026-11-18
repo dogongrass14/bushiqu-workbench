@@ -601,3 +601,24 @@ button.card:active { transform: scale(.995); }
 .topic-bench-reason {
   color: var(--muted); word-break: break-word;
 }
+.hub-approve-all-bar {
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1.5px solid var(--ok);
+  background: var(--ok-bg);
+}
+.hub-approve-all-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.hub-approve-all-btn {
+  width: 100%;
+  font-weight: 800;
+  font-size: 15px;
+}
+.hub-approve-all-note {
+  margin-top: 6px;
+  line-height: 1.45;
+  word-break: break-word;
+}
