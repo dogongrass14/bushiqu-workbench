@@ -283,6 +283,89 @@
     return inFlightLoad;
   }
 
+  // ---------- 手机 → 桌面「按需同步」指令通道 ----------
+  // 平时不自动联网；只有点「刷新」或提交指令时，才写一个很小的信号文件，让桌面端推送最新进度并执行指令。
+  var CLOUD_ACK_WAIT_MS = 150000;
+  var cloudRefreshBusy = false;
+
+  function cloudContentsPath(rel) {
+    var cfg = getCloudConfig();
+    return "/repos/" + cfg.repo + "/contents/" + rel;
+  }
+
+  function cloudSendSignal(reason) {
+    var cfg = getCloudConfig();
+    var seq = Date.now();
+    var p = cloudContentsPath("data/mobile_signal.json");
+    return ghApiFetch("GET", p + "?ref=" + encodeURIComponent(cfg.branch) + "&_=" + seq, { accept: "application/vnd.github+json", timeoutMs: 15000 })
+      .then(function (r) {
+        if (r.status === 404) return null;
+        if (!r.ok) throw new Error("读取信号文件失败 HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (meta) {
+        var body = {
+          message: "workbench(mobile): signal " + reason,
+          content: utf8ToBase64(JSON.stringify({ seq: seq, reason: reason, at: new Date().toISOString() }) + "\n"),
+          branch: cfg.branch
+        };
+        if (meta && meta.sha) body.sha = meta.sha;
+        return ghApiFetch("PUT", p, { bodyObj: body });
+      })
+      .then(function (r) {
+        if (!r.ok) throw new Error("发送同步信号失败 HTTP " + r.status + "（请确认令牌有 Contents 读写权限）");
+        return seq;
+      });
+  }
+
+  function cloudWaitForAck(seq, deadline) {
+    var cfg = getCloudConfig();
+    var p = cloudContentsPath("data/desktop_ack.json");
+    return new Promise(function (resolve) {
+      function again() {
+        if (Date.now() > deadline) { resolve(null); return; }
+        setTimeout(tick, 6000);
+      }
+      function tick() {
+        ghApiFetch("GET", p + "?ref=" + encodeURIComponent(cfg.branch) + "&_=" + Date.now(), { accept: "application/vnd.github.raw+json", timeoutMs: 12000 })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (ack) {
+            if (ack && Number(ack.ack_seq) >= seq) { resolve(ack); return; }
+            again();
+          })
+          .catch(again);
+      }
+      tick();
+    });
+  }
+
+  function cloudManualRefresh() {
+    if (cloudRefreshBusy) return Promise.resolve();
+    cloudRefreshBusy = true;
+    var btn = $("refreshBtn");
+    btn.disabled = true;
+    showBanner("已通知桌面端同步最新进度，等待回执（最长约 2.5 分钟）…", "");
+    return cloudSendSignal("refresh")
+      .then(function (seq) { return cloudWaitForAck(seq, Date.now() + CLOUD_ACK_WAIT_MS); })
+      .then(function (ack) {
+        return cloudLoad(true).then(function () {
+          if (ack) {
+            showBanner("桌面端已回执，已读取最新进度。", "ok");
+          } else {
+            var ts = state.data && state.data.updated_at ? fmtTime(state.data.updated_at) : "未知";
+            showBanner("桌面端在 2.5 分钟内没有响应（可能休眠、关机或断网）。当前显示的是 " + ts + " 的旧数据。", "err");
+          }
+        });
+      })
+      .catch(function (e) {
+        showBanner("刷新失败：" + e.message, "err");
+      })
+      .then(function () {
+        cloudRefreshBusy = false;
+        btn.disabled = false;
+      });
+  }
+
   function applyDecisionToCloudSnapshot(snap, ctx, comment, reqId) {
     var colMap = { topic: "topics", story: "stories", packaging: "packagings", design: "designs" };
     var col = colMap[ctx.type];
@@ -449,7 +532,8 @@
               return { ok: false, _status: 409, message: "云端快照刚有并发更新，请再点一次确认" };
             }
             if (!putResp.ok) throw new Error("更新云端快照失败 HTTP " + putResp.status);
-            return applied;
+            // 指令已落到云端仓库，通知桌面端过来取（不通知就只是存档，桌面端不会执行）
+            return cloudSendSignal("decision:" + ctx.action).then(function () { return applied; }, function () { return applied; });
           });
         });
       });
@@ -2503,6 +2587,14 @@
   });
 
   function resolveSuccessMessage(ctx, deduplicated) {
+    var base = resolveSuccessMessageBase(ctx, deduplicated);
+    if (!deduplicated && isCloudMode()) {
+      return base + "（已通知桌面端，约 1 分钟内执行；过一会点右上角「刷新」查看最新进度）";
+    }
+    return base;
+  }
+
+  function resolveSuccessMessageBase(ctx, deduplicated) {
     if (deduplicated) return "这条决定之前已保存，未重复记录。";
     if (ctx.type === "topic" && ctx.action === "approve") {
       return "✓ 已勾选此题（长视频仅做储备不强制发，Shorts 按每日一期排产）。";
@@ -2677,7 +2769,10 @@
   for (var i = 0; i < tabs.length; i++) {
     tabs[i].addEventListener("click", function () { go(this.dataset.tab); });
   }
-  $("refreshBtn").addEventListener("click", function () { load(false); });
+  $("refreshBtn").addEventListener("click", function () {
+    if (isCloudMode()) cloudManualRefresh();
+    else load(false);
+  });
   // Only refresh the live local progress board; never interrupt reading or an approval form.
   setInterval(function () {
     if (!isCloudMode() && !document.hidden && state.tab === "pipelines" &&
@@ -2686,7 +2781,7 @@
     }
   }, 10000);
   document.addEventListener("visibilitychange", function () {
-    if (!document.hidden && !state.busy && $("sheet").hidden && (Date.now() - lastLoadOkAt > 20000)) {
+    if (!document.hidden && !isCloudMode() && !state.busy && $("sheet").hidden && (Date.now() - lastLoadOkAt > 20000)) {
       load(true);
     }
   });
